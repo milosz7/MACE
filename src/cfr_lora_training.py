@@ -14,6 +14,7 @@ from src.mace_lora_atten_processor import LoRAAttnProcessor
 from diffusers.loaders import AttnProcsLayers
 from diffusers.optimization import get_scheduler
 from diffusers.utils.import_utils import is_xformers_available
+import torch.nn as nn
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 from src.cfr_utils import *
@@ -30,6 +31,7 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         subfolder="text_encoder",
         revision=revision,
     )
+
     model_class = text_encoder_config.architectures[0]
 
     if model_class == "CLIPTextModel":
@@ -125,7 +127,6 @@ def main(args):
 
     # import correct text encoder class
     text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
-
     # Load scheduler and models
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     text_encoder = text_encoder_cls.from_pretrained(
@@ -258,7 +259,69 @@ def main(args):
 
     # stage 1: closed-form refinement
     projection_matrices, ca_layers, og_matrices = get_ca_layers(unet, with_to_k=True)
-    
+    # Build input projection layers to map text embedding dim (e.g. 768) -> each projection layer's expected input dim
+    input_projections = []
+    # Try to infer embedding dim from the text encoder config or embeddings
+    try:
+        emb_dim = int(text_encoder.config.hidden_size)
+    except Exception:
+        try:
+            emb_dim = text_encoder.get_input_embeddings().weight.shape[1]
+        except Exception:
+            emb_dim = 768
+
+    proj_device = projection_matrices[0].weight.device if len(projection_matrices) > 0 else accelerator.device
+    for layer in projection_matrices:
+        in_feat = layer.weight.shape[1]
+        proj = nn.Linear(emb_dim, in_feat, bias=True)
+        # Initialize to approximate identity on overlapping dims to be stable
+        with torch.no_grad():
+            proj.weight.zero_()
+            proj.bias.zero_()
+            overlap = min(emb_dim, in_feat)
+            if overlap > 0:
+                proj.weight[:overlap, :overlap].copy_(torch.eye(overlap))
+        proj.to(proj_device)
+        input_projections.append(proj)
+
+    # Create a global projection to map text encoder embedding dim -> UNet cross-attention dim when needed.
+    # This prevents runtime matmul shape mismatches (e.g. 768 -> 640) when calling UNet.
+    try:
+        cross_attn_dim = unet.config.cross_attention_dim
+    except Exception:
+        cross_attn_dim = None
+
+    # Fallback: if cross_attention_dim is None, try to infer from one of the attn processor layers
+    if cross_attn_dim is None:
+        try:
+            # find first attn processor and inspect its to_k weight in_features
+            for name, proc in unet.attn_processors.items():
+                # proc may be an Attn processor wrapper; drill down to real linear if possible
+                # we only need to get the expected input dim for keys
+                if hasattr(proc, "to_k") and hasattr(proc.to_k, "weight"):
+                    cross_attn_dim = proc.to_k.weight.shape[1]
+                    break
+        except Exception:
+            cross_attn_dim = None
+
+    if cross_attn_dim is None:
+        cross_attn_dim = emb_dim
+
+    global_text_proj = None
+    if emb_dim != cross_attn_dim:
+        global_text_proj = nn.Linear(emb_dim, cross_attn_dim, bias=True)
+        # initialize to identity on overlapping dims for stability
+        with torch.no_grad():
+            global_text_proj.weight.zero_()
+            global_text_proj.bias.zero_()
+            overlap = min(emb_dim, cross_attn_dim)
+            if overlap > 0:
+                for d in range(overlap):
+                    global_text_proj.weight[d, d] = 1.0
+        global_text_proj.to(proj_device)
+        # keep this projection frozen by default (it's just an adapter)
+        global_text_proj.requires_grad_(False)
+
     # to save memory
     CFR_dict = {}
     max_concept_num = args.max_memory # the maximum number of concept that can be processed at once
@@ -270,9 +333,9 @@ def main(args):
             
         for i in tqdm(range(0, len(train_dataset.dict_for_close_form), max_concept_num)):
             contexts_sub, valuess_sub = prepare_k_v(text_encoder, projection_matrices, ca_layers, og_matrices, 
-                                                    train_dataset.dict_for_close_form[i:i+5], tokenizer, all_words=args.all_words)
-            closed_form_refinement(projection_matrices, contexts_sub, valuess_sub, cache_dict=CFR_dict, cache_mode=True)
-            
+                                                    train_dataset.dict_for_close_form[i:i+5], tokenizer, all_words=args.all_words, input_projections=input_projections)
+            closed_form_refinement(projection_matrices, contexts_sub, valuess_sub, cache_dict=CFR_dict, cache_mode=True, input_projections=input_projections)
+
             del contexts_sub, valuess_sub
             gc.collect()
             torch.cuda.empty_cache()
@@ -283,8 +346,8 @@ def main(args):
             CFR_dict[f'{layer_num}_for_mat2'] = .0
             
         contexts, valuess = prepare_k_v(text_encoder, projection_matrices, ca_layers, og_matrices, 
-                                        train_dataset.dict_for_close_form, tokenizer, all_words=args.all_words)
-    
+                                        train_dataset.dict_for_close_form, tokenizer, all_words=args.all_words, input_projections=input_projections)
+
     del ca_layers, og_matrices
 
     # Load cached prior knowledge for preserving
@@ -319,8 +382,8 @@ def main(args):
         closed_form_refinement(projection_matrices, lamb=args.lamb, preserve_scale=1, cache_dict=cache_dict)
     else:
         closed_form_refinement(projection_matrices, contexts, valuess, lamb=args.lamb, 
-                               preserve_scale=args.train_preserve_scale, cache_dict=cache_dict)
-    
+                               preserve_scale=args.train_preserve_scale, cache_dict=cache_dict, input_projections=input_projections)
+
     del contexts, valuess, cache_dict
     gc.collect()
     torch.cuda.empty_cache()
@@ -351,6 +414,44 @@ def main(args):
                     module_name=name, 
                     preserve_prior=args.with_prior_preservation,
                 ))
+
+        # After we've attached LoRA processors, determine the actual expected
+        # cross-attention input dim by inspecting one of the processors' to_k
+        # linear layers. This is more reliable than reading from config because
+        # processors may wrap or change dimensions (SDXL case).
+        actual_cross_attn_dim = None
+        try:
+            for name_p, proc in unet.attn_processors.items():
+                if hasattr(proc, "to_k") and hasattr(proc.to_k, "weight"):
+                    actual_cross_attn_dim = proc.to_k.weight.shape[1]
+                    break
+        except Exception:
+            actual_cross_attn_dim = None
+
+        if actual_cross_attn_dim is None:
+            # fallback to previously computed cross_attn_dim or emb_dim
+            try:
+                actual_cross_attn_dim = cross_attn_dim
+            except Exception:
+                actual_cross_attn_dim = emb_dim
+
+        # (Re)create the global projection if needed so the encoder hidden
+        # states match the processors' expected input dim.
+        if emb_dim != actual_cross_attn_dim:
+            global_text_proj = nn.Linear(emb_dim, actual_cross_attn_dim, bias=True)
+            with torch.no_grad():
+                global_text_proj.weight.zero_()
+                global_text_proj.bias.zero_()
+                overlap = min(emb_dim, actual_cross_attn_dim)
+                if overlap > 0:
+                    for d in range(overlap):
+                        global_text_proj.weight[d, d] = 1.0
+            # place on same device as projection matrices if available
+            try:
+                global_text_proj.to(proj_device)
+            except Exception:
+                pass
+            global_text_proj.requires_grad_(False)
 
         ### set lora
         # unet.set_attn_processor(lora_attn_procs)
@@ -390,6 +491,18 @@ def main(args):
                 unet, optimizer, train_dataloader, lr_scheduler
             )
         
+        # Ensure the global text projection (adapter) is on the correct device and dtype
+        # after models have been prepared/moved by the accelerator. It's frozen by default
+        # so it doesn't need to be part of the optimizer.
+        if 'global_text_proj' in locals() and global_text_proj is not None:
+            try:
+                global_text_proj.to(accelerator.device, dtype=weight_dtype)
+            except Exception:
+                try:
+                    global_text_proj.to(accelerator.device)
+                except Exception:
+                    pass
+
         # We need to initialize the trackers we use, and also store our configuration.
         # The trackers initializes automatically on the main process.
         if accelerator.is_main_process:
@@ -509,8 +622,13 @@ def main(args):
 
                     # Get the text embedding for conditioning
                     encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                    
-                    # set concept_positions for this batch 
+                    # If the text encoder embedding dim doesn't match UNet's cross-attention dim,
+                    # project the encoder hidden states to the expected dim to avoid matmul errors
+                    if global_text_proj is not None:
+                        # global_text_proj expects last-dim = emb_dim
+                        encoder_hidden_states = global_text_proj(encoder_hidden_states)
+
+                    # set concept_positions for this batch
                     if args.use_gsam_mask:
                         GSAM_mask = batch['masks']
                     else:
@@ -606,4 +724,3 @@ def main(args):
         revision=args.revision,
     )
     pipeline.save_pretrained(args.output_dir)
-    

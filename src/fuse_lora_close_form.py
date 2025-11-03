@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from diffusers import StableDiffusionPipeline
 from src.cfr_utils import *
 from src.dataset import MACEDataset
@@ -53,8 +54,34 @@ def main(args):
         
         lora_projection_matrices, lora_ca_layers, lora_og_matrices = get_ca_layers(lora_pipe.unet, with_to_k=True)
 
-        contexts, valuess = prepare_k_v(lora_pipe.text_encoder, lora_projection_matrices, lora_ca_layers, lora_og_matrices, 
-                                        [single_concept], lora_pipe.tokenizer, all_words=True, prepare_k_v_for_lora=True)
+        # Build input_projections: Linear adapters mapping text encoder embedding dim -> each layer.in_features
+        input_projections = []
+        # infer embedding dim from text encoder
+        try:
+            emb_dim = int(lora_pipe.text_encoder.config.hidden_size)
+        except Exception:
+            try:
+                emb_dim = lora_pipe.text_encoder.get_input_embeddings().weight.shape[1]
+            except Exception:
+                emb_dim = 768
+
+        for layer in lora_projection_matrices:
+            in_feat = layer.weight.shape[1]
+            proj = nn.Linear(emb_dim, in_feat, bias=True)
+            # initialize near-identity on overlapping dims for stability
+            with torch.no_grad():
+                proj.weight.zero_()
+                proj.bias.zero_()
+                overlap = min(emb_dim, in_feat)
+                if overlap > 0:
+                    proj.weight[:overlap, :overlap].copy_(torch.eye(overlap))
+            proj.to(layer.weight.device)
+            proj.requires_grad_(False)
+            input_projections.append(proj)
+
+        contexts, valuess = prepare_k_v(lora_pipe.text_encoder, lora_projection_matrices, lora_ca_layers, lora_og_matrices,
+                                        [single_concept], lora_pipe.tokenizer, all_words=True, prepare_k_v_for_lora=True,
+                                        input_projections=input_projections)
 
         # if the number of concept is too large, we need to use cache mode to save memory
         if len(train_dataset.dict_for_close_form) > max_concept_num:
@@ -111,7 +138,3 @@ def main(args):
 
     # save the final model
     final_pipe.save_pretrained(args.final_save_path)
-
-    
-
-
