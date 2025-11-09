@@ -9,7 +9,7 @@ import torch.utils.checkpoint
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel, StableDiffusionXLPipeline
 from src.mace_lora_atten_processor import LoRAAttnProcessor
 from diffusers.loaders import AttnProcsLayers
 from diffusers.optimization import get_scheduler
@@ -24,10 +24,10 @@ import json
 logger = get_logger(__name__)
 
 
-def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
+def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"):
     text_encoder_config = PretrainedConfig.from_pretrained(
         pretrained_model_name_or_path,
-        subfolder="text_encoder",
+        subfolder=subfolder,
         revision=revision,
     )
     model_class = text_encoder_config.architectures[0]
@@ -40,12 +40,17 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
 
         return RobertaSeriesModelWithTransformation
+    elif model_class == "CLIPTextModelWithProjection":
+        from transformers import CLIPTextModelWithProjection
+
+        return CLIPTextModelWithProjection
     else:
         raise ValueError(f"{model_class} is not supported.")
 
 
 def collate_fn(examples, with_prior_preservation=False):
-    input_ids = [example["instance_prompt_ids"] for example in examples]
+    input_ids_1 = [example["instance_prompt_ids_1"] for example in examples]
+    input_ids_2 = [example["instance_prompt_ids_2"] for example in examples]
     concept_positions = [example["concept_positions"] for example in examples]
     pixel_values = [example["instance_images"] for example in examples]
     masks = [example["instance_masks"] for example in examples]
@@ -54,7 +59,8 @@ def collate_fn(examples, with_prior_preservation=False):
     # Concat class and instance examples for prior preservation.
     # We do this to avoid doing two forward passes.
     if with_prior_preservation:
-        input_ids += [example["preserve_prompt_ids"] for example in examples]
+        input_ids_1 += [example["preserve_prompt_ids_1"] for example in examples]
+        input_ids_2 += [example["preserve_prompt_ids_2"] for example in examples]
         pixel_values += [example["preserve_images"] for example in examples]
 
     pixel_values = torch.stack(pixel_values)
@@ -67,12 +73,15 @@ def collate_fn(examples, with_prior_preservation=False):
         ## artistic style erasure
         masks = None
     
-    input_ids = torch.cat(input_ids, dim=0)
+    input_ids_1 = torch.cat(input_ids_1, dim=0)
+    input_ids_2 = torch.cat(input_ids_2, dim=0)
     concept_positions = torch.cat(concept_positions, dim=0).type(torch.BoolTensor)
 
     batch = {
         "instance_prompts": instance_prompts,
-        "input_ids": input_ids,
+        "input_ids": input_ids_1,  # backward-compatible single-tokenizer key
+        "input_ids_1": input_ids_1,
+        "input_ids_2": input_ids_2,
         "pixel_values": pixel_values,
         "masks": masks,
         "concept_positions": concept_positions,
@@ -116,20 +125,31 @@ def main(args):
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, revision=args.revision, use_fast=False)
     elif args.pretrained_model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_one = AutoTokenizer.from_pretrained(
             args.pretrained_model_name_or_path,
             subfolder="tokenizer",
             revision=args.revision,
             use_fast=False,
         )
+        tokenizer_two = AutoTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="tokenizer_2",
+            revision=args.revision,
+            use_fast=False,
+        )
 
     # import correct text encoder class
-    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
+    text_encoder_cls_1 = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder")
+    text_encoder_cls_2 = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2")
+
 
     # Load scheduler and models
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    text_encoder = text_encoder_cls.from_pretrained(
+    text_encoder_one = text_encoder_cls_1.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+    )
+    text_encoder_two = text_encoder_cls_2.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision
     )
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
     unet = UNet2DConditionModel.from_pretrained(
@@ -148,8 +168,9 @@ def main(args):
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     if not args.train_text_encoder:
-        text_encoder.requires_grad_(False)
-    
+        text_encoder_one.requires_grad_(False)
+        text_encoder_two.requires_grad_(False)
+
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             unet.enable_xformers_memory_efficient_attention()
@@ -159,7 +180,8 @@ def main(args):
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
         if args.train_text_encoder:
-            text_encoder.gradient_checkpointing_enable()
+            text_encoder_one.gradient_checkpointing_enable()
+            text_encoder_two.gradient_checkpointing_enable()
 
     # Check that all trainable models are in full precision
     low_precision_error_string = (
@@ -172,9 +194,15 @@ def main(args):
             f"Unet loaded as datatype {accelerator.unwrap_model(unet).dtype}. {low_precision_error_string}"
         )
 
-    if args.train_text_encoder and accelerator.unwrap_model(text_encoder).dtype != torch.float32:
+    if args.train_text_encoder and accelerator.unwrap_model(text_encoder_one).dtype != torch.float32:
         raise ValueError(
-            f"Text encoder loaded as datatype {accelerator.unwrap_model(text_encoder).dtype}."
+            f"Text encoder loaded as datatype {accelerator.unwrap_model(text_encoder_one).dtype}."
+            f" {low_precision_error_string}"
+        )
+
+    if args.train_text_encoder and accelerator.unwrap_model(text_encoder_two).dtype != torch.float32:
+        raise ValueError(
+            f"Text encoder loaded as datatype {accelerator.unwrap_model(text_encoder_two).dtype}."
             f" {low_precision_error_string}"
         )
 
@@ -212,7 +240,8 @@ def main(args):
         args.preservation_info = None
     
     train_dataset = MACEDataset(
-        tokenizer=tokenizer,
+        tokenizer_1=tokenizer_one,
+        tokenizer_2=tokenizer_two,
         size=args.resolution,
         center_crop=args.center_crop,
         use_pooler=args.use_pooler,
@@ -254,7 +283,8 @@ def main(args):
         
     # Move vae and text_encoder to device and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    text_encoder_one.to(accelerator.device, dtype=weight_dtype)
+    text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
     # stage 1: closed-form refinement
     projection_matrices, ca_layers, og_matrices = get_ca_layers(unet, with_to_k=True)
@@ -269,8 +299,8 @@ def main(args):
             CFR_dict[f'{layer_num}_for_mat2'] = None
             
         for i in tqdm(range(0, len(train_dataset.dict_for_close_form), max_concept_num)):
-            contexts_sub, valuess_sub = prepare_k_v(text_encoder, projection_matrices, ca_layers, og_matrices, 
-                                                    train_dataset.dict_for_close_form[i:i+5], tokenizer, all_words=args.all_words)
+            contexts_sub, valuess_sub = prepare_k_v(text_encoder_one, text_encoder_two, projection_matrices, ca_layers, og_matrices,
+                                                    train_dataset.dict_for_close_form[i:i+5], tokenizer_one, tokenizer_two, all_words=args.all_words)
             closed_form_refinement(projection_matrices, contexts_sub, valuess_sub, cache_dict=CFR_dict, cache_mode=True)
             
             del contexts_sub, valuess_sub
@@ -282,8 +312,8 @@ def main(args):
             CFR_dict[f'{layer_num}_for_mat1'] = .0
             CFR_dict[f'{layer_num}_for_mat2'] = .0
             
-        contexts, valuess = prepare_k_v(text_encoder, projection_matrices, ca_layers, og_matrices, 
-                                        train_dataset.dict_for_close_form, tokenizer, all_words=args.all_words)
+        contexts, valuess = prepare_k_v(text_encoder_one, text_encoder_two, projection_matrices, ca_layers, og_matrices,
+                                        train_dataset.dict_for_close_form, tokenizer_one, tokenizer_two, all_words=args.all_words)
     
     del ca_layers, og_matrices
 
@@ -380,16 +410,15 @@ def main(args):
             num_cycles=args.lr_num_cycles,
             power=args.lr_power,
         )
-        
+
         if args.train_text_encoder:
-            unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+            unet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                unet, text_encoder_one, text_encoder_two, optimizer, train_dataloader, lr_scheduler
             )
         else:
             unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
                 unet, optimizer, train_dataloader, lr_scheduler
             )
-        
         # We need to initialize the trackers we use, and also store our configuration.
         # The trackers initializes automatically on the main process.
         if accelerator.is_main_process:
@@ -462,8 +491,9 @@ def main(args):
         for epoch in range(first_epoch, args.num_train_epochs):
             unet.train()
             if args.train_text_encoder:
-                text_encoder.train()
-                
+                text_encoder_one.train()
+                text_encoder_two.train()
+
             torch.cuda.empty_cache()
             gc.collect()
             
@@ -508,8 +538,24 @@ def main(args):
                         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                     # Get the text embedding for conditioning
-                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                    
+                    input_ids_1 = batch["input_ids_1"].to(text_encoder_one.device)
+                    input_ids_2 = batch["input_ids_2"].to(text_encoder_two.device)
+
+                    enc_out_1 = text_encoder_one(input_ids_1).last_hidden_state  # (B, 77, 1024)
+                    enc_out_2_full = text_encoder_two(input_ids_2)
+                    enc_out_2_hidden_states = enc_out_2_full.last_hidden_state  # (B, 77, 1280)
+                    pooled_output_2 = enc_out_2_full.text_embeds  # (B, 1280)
+
+                    combined_embeds = torch.cat([enc_out_1, enc_out_2_hidden_states], dim=-1)
+                    # encoder_hidden_states = text_encoder_one(batch["input_ids_1"])
+                    # encoder_hidden_states = text_encoder_one(batch["input_ids_2"])[0]
+                    time_ids = torch.tensor(
+                        [[args.resolution, args.resolution, 0, 0, args.resolution, args.resolution]],
+                        dtype=torch.float32,
+                        device=accelerator.device
+                    )
+                    time_ids = time_ids.repeat(bsz, 1)  # Shape: (batch_size, 6)
+
                     # set concept_positions for this batch 
                     if args.use_gsam_mask:
                         GSAM_mask = batch['masks']
@@ -519,8 +565,12 @@ def main(args):
                     attn_controller.set_concept_positions(batch["concept_positions"], GSAM_mask, use_gsam_mask=args.use_gsam_mask)
 
                     # Predict the noise residual
-                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
+                    model_pred = unet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=combined_embeds,
+                        added_cond_kwargs={"text_embeds": pooled_output_2, "time_ids": time_ids}
+                    ).sample
                     # Get the target for loss depending on the prediction type
                     if noise_scheduler.config.prediction_type == "epsilon":
                         target = noise
@@ -598,12 +648,14 @@ def main(args):
             break
     
     # save base initialized model 
-    pipeline = DiffusionPipeline.from_pretrained(
+    pipeline = StableDiffusionXLPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         unet=accelerator.unwrap_model(unet),
-        text_encoder=accelerator.unwrap_model(text_encoder),
-        tokenizer=tokenizer,
+        text_encoder=accelerator.unwrap_model(text_encoder_one),
+        text_encoder_2=accelerator.unwrap_model(text_encoder_two),
+        tokenizer=tokenizer_one,
+        tokenizer_2=tokenizer_two,
         revision=args.revision,
     )
     pipeline.save_pretrained(args.output_dir)
-    
+

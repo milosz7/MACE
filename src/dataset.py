@@ -13,6 +13,30 @@ BASE_URL = ''
 API_KEY = ''
 
 
+def tokenize_prompt(tokenizer_1, tokenizer_2, prompt, max_length=77):
+    """Tokenize prompt with both SDXL tokenizers."""
+    tokens_1 = tokenizer_1(
+        prompt,
+        padding="max_length",
+        max_length=max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+
+    tokens_2 = tokenizer_2(
+        prompt,
+        padding="max_length",
+        max_length=max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+
+    return {
+        "input_ids_1": tokens_1.input_ids,
+        "input_ids_2": tokens_2.input_ids,
+    }
+
+
 def clean_prompt(class_prompt_collection):
     class_prompt_collection = [re.sub(
         r"[0-9]+", lambda num: '' * len(num.group(0)), prompt) for prompt in class_prompt_collection]
@@ -71,7 +95,8 @@ class MACEDataset(Dataset):
 
     def __init__(
         self,
-        tokenizer,
+        tokenizer_1,
+        tokenizer_2,
         size=512,
         center_crop=False,
         use_pooler=False,
@@ -92,7 +117,8 @@ class MACEDataset(Dataset):
         self.use_pooler = use_pooler
         self.size = size
         self.center_crop = center_crop
-        self.tokenizer = tokenizer
+        self.tokenizer_1 = tokenizer_1
+        self.tokenizer_2 = tokenizer_2
         self.batch_counter = 0
         self.batch_size = batch_size
         self.concept_number = 0
@@ -210,31 +236,32 @@ class MACEDataset(Dataset):
         example["instance_images"] = self.image_transforms(instance_image)
         example["instance_masks"] = binary_tensor
 
-        example["instance_prompt_ids"] = self.tokenizer(
+        instance_tokens = tokenize_prompt(
+            self.tokenizer_1,
+            self.tokenizer_2,
+            instance_prompt
+        )
+        example["instance_prompt_ids_1"] = instance_tokens["input_ids_1"]
+        example["instance_prompt_ids_2"] = instance_tokens["input_ids_2"]
+
+        prompt_ids = self.tokenizer_1(
             instance_prompt,
             truncation=True,
             padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids
-        prompt_ids = self.tokenizer(
-            instance_prompt,
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length
+            max_length=self.tokenizer_1.model_max_length
         ).input_ids
 
-        concept_ids = self.tokenizer(
+        concept_ids = self.tokenizer_1(
             target_tokens,
             add_special_tokens=False
         ).input_ids             
 
-        pooler_token_id = self.tokenizer(
+        pooler_token_id = self.tokenizer_1(
             "<|endoftext|>",
             add_special_tokens=False
         ).input_ids[0]
 
-        concept_positions = [0] * self.tokenizer.model_max_length
+        concept_positions = [0] * self.tokenizer_1.model_max_length
         for i, tok_id in enumerate(prompt_ids):
             if tok_id == concept_ids[0] and prompt_ids[i:i + len(concept_ids)] == concept_ids:
                 concept_positions[i:i + len(concept_ids)] = [1]*len(concept_ids)
@@ -248,12 +275,13 @@ class MACEDataset(Dataset):
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             example["preserve_images"] = self.image_transforms(class_image)
-            example["preserve_prompt_ids"] = self.tokenizer(
-                class_prompt,
-                padding="max_length",
-                truncation=True,
-                max_length=self.tokenizer.model_max_length,
-                return_tensors="pt",
-            ).input_ids
-            
+            preserve_tokens = tokenize_prompt(
+                self.tokenizer_1,
+                self.tokenizer_2,
+                class_prompt
+            )
+            example["preserve_prompt_ids_1"] = preserve_tokens["input_ids_1"]
+            example["preserve_prompt_ids_2"] = preserve_tokens["input_ids_2"]
+
+
         return example

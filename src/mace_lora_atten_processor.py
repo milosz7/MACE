@@ -55,15 +55,18 @@ class AttnProcessor:
         value = attn.head_to_batch_dim(value)
 
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        
+
         if key.shape[1] == 77 and self.attn_controller is not None:
             self.attn_controller(attention_probs, self.module_name, preserve_prior=True, latent_num=hidden_states.shape[0])
-            
+
         hidden_states = torch.bmm(attention_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
 
         # linear proj
-        hidden_states = attn.to_out[0](hidden_states, scale=scale)
+        out_proj = attn.to_out[0](hidden_states)
+        if scale != 1.0:
+            out_proj = out_proj * scale
+        hidden_states = out_proj
         # dropout
         hidden_states = attn.to_out[1](hidden_states)
 

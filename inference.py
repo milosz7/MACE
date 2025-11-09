@@ -1,6 +1,6 @@
 import os, gc
 import torch
-from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
 from omegaconf import OmegaConf
 import argparse
 
@@ -8,7 +8,7 @@ import argparse
 def main(args):
 
     model_id = args.pretrained_model_name_or_path
-    pipe = StableDiffusionPipeline.from_pretrained(model_id).to(args.device)
+    pipe = StableDiffusionXLPipeline.from_pretrained(model_id).to(args.device)
     pipe.safety_checker = None
     pipe.requires_safety_checker = False
     torch.Generator(device=args.device).manual_seed(42)

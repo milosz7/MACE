@@ -29,7 +29,7 @@ def find_matching_indices(old, new):
     return list(range(start_common)) + list(range(end_common_old + 1, len(old))), \
            list(range(start_common)) + list(range(end_common_new + 1, len(new)))
        
-           
+
 def get_ca_layers(unet, with_to_k=True):
 
     sub_nets = unet.named_children()
@@ -56,16 +56,60 @@ def get_ca_layers(unet, with_to_k=True):
     return projection_matrices, ca_layers, og_matrices
 
 
-def prepare_k_v(text_encoder, projection_matrices, ca_layers, og_matrices, test_set, 
-                tokenizer, with_to_k=True, all_words=False, prepare_k_v_for_lora=False):
+def get_text_embeddings(text_encoder_1, text_encoder_2, tokenizer_1, tokenizer_2, texts, device=None):
+    """
+    Tokenize `texts` with both tokenizers and return concatenated last_hidden_state embeddings.
+    Returns tensor of shape (batch, seq_len, hidden1+hidden2).
+    """
+    if isinstance(texts, str):
+        texts = [texts]
+
+    tokenized_inputs_1 = tokenizer_1(
+        texts,
+        padding="max_length",
+        max_length=tokenizer_1.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+
+    tokenized_inputs_2 = tokenizer_2(
+        texts,
+        padding="max_length",
+        max_length=tokenizer_2.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+
+    # choose device
+    if device is None:
+        device = text_encoder_1.device
+
+    input_ids_1 = tokenized_inputs_1.input_ids.to(device)
+    input_ids_2 = tokenized_inputs_2.input_ids.to(device)
+
+    # Get embeddings
+    with torch.no_grad():
+        emb1 = text_encoder_1(input_ids_1).last_hidden_state
+        emb2_out = text_encoder_2(input_ids_2)
+        emb2 = emb2_out.last_hidden_state
+
+    # Concatenate along hidden dimension
+    return torch.cat([emb1, emb2], dim=-1)
+
+
+def prepare_k_v(text_encoder_1, text_encoder_2, projection_matrices, ca_layers, og_matrices, test_set,
+                tokenizer_1, tokenizer_2, with_to_k=True, all_words=False, prepare_k_v_for_lora=False):
     
     with torch.no_grad():
         all_contexts, all_valuess = [], []
         
         for curr_item in test_set:
             gc.collect()
-            torch.cuda.empty_cache()
-            
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
             #### restart LDM parameters
             num_ca_clip_layers = len(ca_layers)
             for idx_, l in enumerate(ca_layers):
@@ -84,23 +128,19 @@ def prepare_k_v(text_encoder, projection_matrices, ca_layers, og_matrices, test_
             texts_new = [item[0] for item in curr_item["new"]]
             texts_combined = texts_old + texts_new
 
-            tokenized_inputs = tokenizer(
-                texts_combined,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt"
+            # Get concatenated embeddings using helper
+            text_embeddings = get_text_embeddings(
+                text_encoder_1, text_encoder_2, tokenizer_1, tokenizer_2, texts_combined,
+                device=text_encoder_1.device,
             )
-            
-            # Text embeddings
-            text_embeddings = text_encoder(tokenized_inputs.input_ids.to(text_encoder.device))[0]
+
             old_embs.extend(text_embeddings[:len(texts_old)])
             new_embs.extend(text_embeddings[len(texts_old):])
 
             # Find matching indices
             for old_text, new_text in zip(texts_old, texts_new):
-                tokens_a = tokenizer(old_text).input_ids
-                tokens_b = tokenizer(new_text).input_ids
+                tokens_a = tokenizer_1(old_text).input_ids
+                tokens_b = tokenizer_1(new_text).input_ids
                 
                 old_indices, new_indices = find_matching_indices(tokens_a, tokens_b)
                 
@@ -159,8 +199,11 @@ def closed_form_refinement(projection_matrices, all_contexts=None, all_valuess=N
             
         for layer_num in tqdm(range(len(projection_matrices))):
             gc.collect()
-            torch.cuda.empty_cache()
-            
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
             mat1 = lamb * projection_matrices[layer_num].weight
             mat2 = lamb * torch.eye(projection_matrices[layer_num].weight.shape[1], device=projection_matrices[layer_num].weight.device)
             
@@ -202,6 +245,7 @@ def closed_form_refinement(projection_matrices, all_contexts=None, all_valuess=N
                 projection_matrices[layer_num].weight.data = total_for_mat1 @ torch.inverse(total_for_mat2) 
                 
             del total_for_mat1, total_for_mat2
+
 
 
 def importance_sampling_fn(t, temperature=0.05):
@@ -341,5 +385,3 @@ def prompt_augmentation(content, augment=True, sampled_indices=None, concept_typ
         sampled_prompts = prompts
         
     return sampled_prompts
-   
-
